@@ -31,9 +31,21 @@ The manifest is just preset values that autofill in the dashboard when you train
 
 `kind` says what your plugin does. Valid values: `"trainer"` (train a model), `"finetune"` (refine one), `"distill"` (distill one), `"eval"` (run a rubric).
 
-`flow` is how it does it. Valid values: `"scratch"` (from zero), `"continue"` (pick up an existing checkpoint), `"adapter"` (train just an adapter on a frozen base).
+`flow` is how it does it. Valid values: `"scratch"` (from zero), `"continue"` (pick up an existing checkpoint), `"adapter"` (train just an adapter on a frozen base). `flow` may also be a list (e.g. `["scratch", "continue"]`) when the same trainer supports more than one entry point.
 
 The keys under `defaults` line up with fields the dashboard already knows how to render. Pick the ones you have an opinion about and skip the rest.
+
+### Reserved trainer flags
+
+A handful of `defaults` (and `args`) keys are *reserved*. The dashboard recognizes them by name and renders them with extra affordances (special label, color, tooltip, validation). Use the reserved name when your trainer supports the underlying behavior; do not invent a near-synonym. New reserved flags are added here as the platform grows. If you support a reserved flag, declare it in `defaults` (or `args`) so it shows up in the form.
+
+| key | type | what it means | dashboard treatment |
+|---|---|---|---|
+| `qat_enabled` | bool | If true, the trainer wraps matmul weights, embeddings, RMSNorm, and the residual add with fake-quant ops (per-tensor maxabs INT8 weights, scale-32 INT8 activations, scale-64 LN weights) using a straight-through estimator on backprop. Result: a checkpoint whose v9 export lands with `act_boost=1` and runs cleanly on the C engine. Works on both `scratch` and `continue` flows; on `continue` it is the canonical way to repair a non-QAT checkpoint without retraining. | Rendered as a checkbox labeled **INT8 QAT** highlighted in blue. Tooltip explains the effect. Recorded into `config.json` as `"training": "qat"` so the Generation tab's Veritate warning suppresses for the resulting model. |
+
+When a reserved flag is set, write the matching value into `args` so `save.save` records it in `config.json`. For `qat_enabled = true` the convention is `args["training"] = "qat"`.
+
+If you need a flag the dashboard should treat as featured but it is not in the table above, file it as a contract update against `documentation/plugins/contract.md` rather than shipping a one-off. The point of the reservation is that one trainer's "INT8 QAT" toggle and another's are the *same* toggle on the dashboard.
 
 ## Hooking into the dump system (REQUIRED for trainers)
 
