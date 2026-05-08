@@ -1,0 +1,35 @@
+{
+  "name": "Veritate 80M (default base model, two-phase QAT)",
+  "description": "The default base model trainer at 80M. Pure-vanilla Veritate, tuned for byte-level TinyStories coherence and fast iteration (~30-60 min phase A on 12 GB). Two-phase recipe: train non-QAT first (qat_enabled=false), then resume with qat_enabled=true for the last ~25% of the budget. Exports to a v9 INT8 binary that loads cleanly on the C engine. Same hyperparameter family as veritate_200, retuned for the smaller scale: higher peak LR, larger batch, no activation checkpointing.",
+  "kind": "trainer",
+  "flow": [
+    "scratch",
+    "continue"
+  ],
+  "defaults": {
+    "size": "80m",
+    "precision": "bf16",
+    "version": "v1",
+    "total_steps": 10000,
+    "batch_size": 24,
+    "seq": 256,
+    "n_chunks": 96,
+    "bptt_window": 8,
+    "base_lr": 0.0005,
+    "min_lr": 0.00005,
+    "warmup_steps": 500,
+    "lr_schedule": "cosine",
+    "weight_decay": 0.1,
+    "beta1": 0.9,
+    "beta2": 0.95,
+    "label_smoothing": 0.0,
+    "grad_clip": 1.0,
+    "ckpt_every": 500,
+    "log_every": 20,
+    "eval_every": 500,
+    "eval_iters": 12,
+    "seed": 0,
+    "use_act_ckpt": false,
+    "qat_enabled": false
+  }
+}

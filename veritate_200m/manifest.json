@@ -1,0 +1,35 @@
+{
+  "name": "Veritate 200M (default base model, two-phase QAT)",
+  "description": "The default base model trainer. Pure-vanilla Veritate at 200M, tuned for byte-level TinyStories coherence. Two-phase recipe: train non-QAT first (qat_enabled=false), then resume with qat_enabled=true for the last ~25% of the budget. Exports to a v9 INT8 binary that loads cleanly on the C engine. Hyperparameters derived from TinyStories paper + minGPT + PyTorch QAT recipe.",
+  "kind": "trainer",
+  "flow": [
+    "scratch",
+    "continue"
+  ],
+  "defaults": {
+    "size": "200m",
+    "precision": "bf16",
+    "version": "v1",
+    "total_steps": 12000,
+    "batch_size": 16,
+    "seq": 256,
+    "n_chunks": 96,
+    "bptt_window": 8,
+    "base_lr": 0.0003,
+    "min_lr": 0.00003,
+    "warmup_steps": 500,
+    "lr_schedule": "cosine",
+    "weight_decay": 0.1,
+    "beta1": 0.9,
+    "beta2": 0.95,
+    "label_smoothing": 0.0,
+    "grad_clip": 1.0,
+    "ckpt_every": 500,
+    "log_every": 20,
+    "eval_every": 500,
+    "eval_iters": 12,
+    "seed": 0,
+    "use_act_ckpt": true,
+    "qat_enabled": false
+  }
+}

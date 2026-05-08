@@ -2,3 +2,15 @@
 !**/corpus/.gitkeep
 __pycache__/
 prune*
+
+# track only the veritate_* default plugins (plus the readme + this file).
+# multimind_*, example_plugin, common/, and any user-local experiments
+# stay untracked so the public ship surface is just the veritate_<size>
+# defaults. add a new default by prefixing it `veritate_` and the rule
+# below picks it up automatically.
+/*
+!/veritate_*
+!/readme.md
+!/.gitignore
+!/corpus
+
