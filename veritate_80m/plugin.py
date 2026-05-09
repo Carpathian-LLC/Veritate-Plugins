@@ -240,7 +240,7 @@ def write_config(name, args, base_cfg, n_params, corpus_hash):
 
 
 def load_resume_state(model, name, step, device):
-    ckpt = torch.load(paths.checkpoint_path(name, step), map_location=device, weights_only=False)
+    ckpt = torch.load(paths.checkpoint_path(name, step), map_location=device, weights_only=True)
     sd = ckpt["model"]
     if any(k.startswith("base.") for k in sd):
         # incoming checkpoint was wrapped by an adapter (M1/M3); strip the base.
