@@ -162,11 +162,23 @@ def make_data_loader(bin_path, total_chunk_len, batch_size, seed):
     return draw, N
 
 
-def chunked_step(model, tokens, targets, seq, amp_dtype, *, backward=False, bptt_window=1):
+def pick_device():
+    """Pick the best available training backend. CUDA preferred, then Apple
+    Silicon MPS, then CPU. Lets the same plugin run on Linux/Windows GPU
+    boxes, Apple Silicon Macs, and CPU-only environments without code edits."""
+    if torch.cuda.is_available():
+        return "cuda"
+    if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
+        return "mps"
+    return "cpu"
+
+
+def chunked_step(model, tokens, targets, seq, amp_dtype, *, backward=False, bptt_window=1, device_type="cuda"):
     """Process the full per-step chunk_len through the vanilla forward in
     seq-sized sub-chunks. Vanilla Veritate has no recurrent state, so
     bptt_window only affects when the gradient path is closed and reopened.
     Practically equivalent to S/seq independent forward+backward calls.
+    `device_type` selects the autocast backend ("cuda", "mps", or "cpu").
     """
     B, total_len = tokens.shape
     n_chunks = max(1, total_len // seq)
@@ -180,7 +192,7 @@ def chunked_step(model, tokens, targets, seq, amp_dtype, *, backward=False, bptt
         cg = targets[:, cstart:cend]
         if ct.size(1) < 2:
             break
-        with torch.autocast(device_type="cuda", dtype=amp_dtype, enabled=(amp_dtype is not None)):
+        with torch.autocast(device_type=device_type, dtype=amp_dtype, enabled=(amp_dtype is not None)):
             _, loss = model(ct, targets=cg)
         if loss is None or not torch.isfinite(loss):
             continue
@@ -239,14 +251,15 @@ def load_resume_state(model, name, step, device):
 
 
 @torch.no_grad()
-def evaluate(model, val_draw, n_iters, seq, amp_dtype, bptt_window):
+def evaluate(model, val_draw, n_iters, seq, amp_dtype, bptt_window, device_type="cuda"):
     model.eval()
     losses = []
     for _ in range(n_iters):
         toks, tgts = val_draw()
         toks = toks.to(next(model.parameters()).device, non_blocking=True)
         tgts = tgts.to(next(model.parameters()).device, non_blocking=True)
-        loss = chunked_step(model, toks, tgts, seq, amp_dtype, bptt_window=bptt_window)
+        loss = chunked_step(model, toks, tgts, seq, amp_dtype,
+                            bptt_window=bptt_window, device_type=device_type)
         if loss is not None:
             losses.append(float(loss))
     model.train()
@@ -298,12 +311,8 @@ def main():
 
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
-    if not torch.cuda.is_available():
-        raise RuntimeError(
-            "cuda not available. veritate training requires a cuda-capable torch build. "
-            "current torch: " + torch.__version__ + " (cuda=" + str(torch.version.cuda) + ")."
-        )
-    device = "cuda"
+    device = pick_device()
+    print(f"device: {device}", flush=True)
     amp_dtype = torch.bfloat16 if args.precision == "bf16" else None
 
     shape = SIZE_PRESETS[args.size]
@@ -385,7 +394,8 @@ def main():
         veritate_model.train()
         opt.zero_grad(set_to_none=True)
         loss = chunked_step(veritate_model, toks, tgts, args.seq, amp_dtype,
-                            backward=True, bptt_window=args.bptt_window)
+                            backward=True, bptt_window=args.bptt_window,
+                            device_type=device)
         if loss is None:
             continue
         gn = torch.nn.utils.clip_grad_norm_(veritate_model.parameters(), args.grad_clip)
@@ -407,7 +417,8 @@ def main():
             last_log_step = step
 
         if val_draw is not None and step % args.eval_every == 0:
-            v = evaluate(veritate_model, val_draw, args.eval_iters, args.seq, amp_dtype, args.bptt_window)
+            v = evaluate(veritate_model, val_draw, args.eval_iters, args.seq, amp_dtype,
+                         args.bptt_window, device_type=device)
             if v is not None:
                 print("step " + str(step) + "  val_loss " + format(v, ".4f"), flush=True)
                 append_train_row(name, step, "val", v, lr=lr,
