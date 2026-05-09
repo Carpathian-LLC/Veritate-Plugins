@@ -316,6 +316,22 @@ def main():
     amp_dtype = torch.bfloat16 if args.precision == "bf16" else None
 
     shape = SIZE_PRESETS[args.size]
+    # Apple MPS indexes tensor elements with int32 inside MPSGraph. The largest
+    # tensor on the autograd path is the attention scores (B*heads*T*T); if it
+    # exceeds INT_MAX backward fails with the opaque "MPSGraph does not support
+    # tensor dims larger than INT_MAX" error. Catch it up front with a config
+    # the user can act on.
+    if device == "mps":
+        attn_elems = args.batch_size * shape["heads"] * args.seq * args.seq
+        mps_int_max = 2_147_483_647
+        if attn_elems > mps_int_max:
+            max_b = max(1, mps_int_max // (shape["heads"] * args.seq * args.seq))
+            raise RuntimeError(
+                "config exceeds Apple MPS attention-tensor limit: "
+                "B*heads*seq*seq = " + str(attn_elems) + " > INT_MAX (" + str(mps_int_max) + "). "
+                "Reduce --batch_size to <=" + str(max_b) + " (current " + str(args.batch_size) + ") "
+                "or reduce --seq."
+            )
     veritate_model = Veritate(
         vocab=VOCAB_BYTE_LEVEL,
         hidden=shape["hidden"], layers=shape["layers"],
