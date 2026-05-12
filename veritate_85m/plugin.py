@@ -288,6 +288,38 @@ def make_data_loader(bin_path, total_chunk_len, batch_size, seed):
     return draw, N
 
 
+def apply_resume_overrides(args, argv):
+    """Restore the original training_args from the resumed model's config.json
+    for any flag the caller did NOT pass on the CLI. Matches the contract used
+    by the 800m / 1b / 200m / 80m plugins so a continue-training run picks up
+    the right corpus / shape / schedule by default, while still letting the
+    user explicitly override (e.g. swap corpus, extend total_steps)."""
+    cfg_path = paths.config_path(args.resume)
+    if not os.path.isfile(cfg_path):
+        return  # no config — nothing to restore; fall back to CLI / manifest defaults
+    try:
+        with open(cfg_path, "r", encoding="utf-8") as f:
+            cfg = json.load(f)
+    except (OSError, ValueError):
+        return
+    ta = cfg.get("training_args") or {}
+    for k, v in ta.items():
+        if not hasattr(args, k):
+            continue
+        flag = "--" + k
+        # If the user passed this flag on the CLI (with value or as bare arg),
+        # respect the explicit override and do not replay the config value.
+        if any(a == flag or a.startswith(flag + "=") for a in argv):
+            continue
+        cur = getattr(args, k)
+        if isinstance(cur, bool) and not isinstance(v, bool):
+            continue
+        try:
+            setattr(args, k, type(cur)(v) if cur is not None else v)
+        except (TypeError, ValueError):
+            setattr(args, k, v)
+
+
 def latest_checkpoint_step(model_dir):
     ckpt_dir = os.path.join(model_dir, "checkpoints")
     if not os.path.isdir(ckpt_dir):
@@ -296,9 +328,18 @@ def latest_checkpoint_step(model_dir):
     for fn in os.listdir(ckpt_dir):
         if fn.startswith(BASE_CKPT_PREFIX) and fn.endswith(BASE_CKPT_SUFFIX):
             try:
-                steps.append(int(fn[len(BASE_CKPT_PREFIX):-len(BASE_CKPT_SUFFIX)]))
+                n = int(fn[len(BASE_CKPT_PREFIX):-len(BASE_CKPT_SUFFIX)])
             except ValueError:
                 continue
+            # Skip obvious junk: zero-byte / truncated stubs from a crash
+            # mid-save before atomic-write landed. A real 85M bf16 checkpoint
+            # is ~170MB; <100KB is always a partial torch.save preamble.
+            try:
+                if os.path.getsize(os.path.join(ckpt_dir, fn)) < 100_000:
+                    continue
+            except OSError:
+                continue
+            steps.append(n)
     if not steps:
         raise FileNotFoundError("no step_*.pt under: " + ckpt_dir)
     return max(steps)
@@ -309,12 +350,15 @@ def latest_checkpoint_step(model_dir):
 
 def parse_args():
     ap = argparse.ArgumentParser(description=MANIFEST.get("description", ""))
-    ap.add_argument("--corpus_bin", type=str,
-                    default=os.path.join(REPO_ROOT, "plugins", "corpus", "fineweb_edu_train.bin"),
-                    help="Path to the byte-level training .bin (built by build_corpus.py).")
-    ap.add_argument("--val_bin", type=str,
-                    default=os.path.join(REPO_ROOT, "plugins", "corpus", "fineweb_edu_val.bin"),
-                    help="Path to the byte-level val .bin (built by build_corpus.py).")
+    # Path overrides. Default to "" so the resolver in main() picks paths from
+    # --corpus <stem> via the shared corpus reader. Pass explicit paths only
+    # when running outside the dashboard or pointing at a custom .bin.
+    ap.add_argument("--corpus_bin", type=str, default="",
+                    help="Override training .bin path. If empty (default), resolved "
+                         "from --corpus stem via the shared corpus reader.")
+    ap.add_argument("--val_bin", type=str, default="",
+                    help="Override val .bin path. If empty (default), resolved from "
+                         "--corpus stem via the shared corpus reader.")
     ap.add_argument("--output_dir", type=str,
                     default=os.path.join(REPO_ROOT, "models", "fineweb_edu_85m_bf16_v1_sparse"),
                     help="Output model directory. Ignored when --name is set.")
@@ -338,7 +382,13 @@ def parse_args():
             ap.add_argument("--" + k, type=float, default=v)
         else:
             ap.add_argument("--" + k, type=str, default=str(v))
-    return ap.parse_args()
+    # parse_known_args so the dashboard can send standard-schema flags this
+    # plugin doesn't implement (e.g. --qat_enabled on a non-QAT trainer) and
+    # they get silently dropped instead of crashing argparse. The dashboard
+    # schema is the source of truth for which fields render; the manifest
+    # only supplies pre-filled defaults.
+    args, _ = ap.parse_known_args()
+    return args
 
 
 # ------------------------------------------------------------------------------------
@@ -346,12 +396,34 @@ def parse_args():
 
 def main():
     args = parse_args()
+
+    # On --resume, replay the resumed model's training_args from config.json
+    # for any flag the user did not pass on this CLI. Without this, a blank
+    # corpus picker (the dashboard's "keep the original" affordance) would
+    # silently fall through to the manifest default and swap corpora.
+    if args.resume and args.resume.strip():
+        apply_resume_overrides(args, sys.argv)
+
     if args.lr_schedule not in LR_SCHEDULES:
         raise ValueError(f"unknown lr_schedule: {args.lr_schedule}")
     if args.lr_schedule == "wsd" and args.wsd_decay_kind not in WSD_DECAY_KINDS:
         raise ValueError(f"unknown wsd_decay_kind: {args.wsd_decay_kind}")
     if args.precision not in PRECISIONS:
         raise ValueError(f"unknown precision: {args.precision}")
+
+    # Resolve corpus stem → train/val .bin paths via the shared reader, unless
+    # the caller passed explicit overrides. Centralizes "where do corpora live"
+    # so the 85m honors the dashboard's corpus picker just like 800m/200m/etc.
+    if not args.corpus_bin or not args.val_bin:
+        stem = (getattr(args, "corpus", "") or "").strip()
+        if not stem:
+            raise ValueError("no --corpus stem and no --corpus_bin override")
+        resolved_train, resolved_val = save.resolve_corpus(stem)
+        if not args.corpus_bin:
+            args.corpus_bin = resolved_train
+        if not args.val_bin and resolved_val:
+            args.val_bin = resolved_val
+
     if not os.path.isfile(args.corpus_bin):
         raise FileNotFoundError(
             f"corpus_bin not found: {args.corpus_bin}\n"
@@ -423,7 +495,13 @@ def main():
         model.load_state_dict(ckpt["model"], strict=True)
         opt.load_state_dict(ckpt["optimizer"])
         start_step = ckpt.get("step", last)
-        print(f"[veritate_85m] resumed from step {start_step}", flush=True)
+        # Drop CSV rows past the checkpoint. Steps logged between the last .pt
+        # and the crash never reached disk and will be retrained; leaving them
+        # would put duplicate step numbers in the file.
+        dropped = save.truncate_train_csv_at(name, start_step)
+        print(f"[veritate_85m] resumed from step {start_step}"
+              + (f" (dropped {dropped} stale CSV row(s))" if dropped else ""),
+              flush=True)
 
     # config.json is written by save.save() via _ensure_config the first time
     # save.save() runs for this model dir; no need to write it here.

@@ -310,6 +310,9 @@ _RESERVED_FLAGS = {"corpus", "description", "resume"}
 def parse_args():
     ap = argparse.ArgumentParser(description=MANIFEST.get("description", ""))
     ap.add_argument("--corpus",      type=str, default="")
+    ap.add_argument("--name",        type=str, default="",
+                    help="user-friendly model slug; final dir = <name>_<size>. "
+                         "If empty, falls back to legacy <corpus>_<size>_<precision>_<version>.")
     ap.add_argument("--description", type=str, default="")
     ap.add_argument("--resume",      type=str, default="")
     for k, v in MANIFEST.get("defaults", {}).items():
@@ -331,7 +334,11 @@ def parse_args():
             ap.add_argument("--" + k, type=float, default=v)
         else:
             ap.add_argument("--" + k, type=str,   default=str(v))
-    return ap.parse_args()
+    # parse_known_args so dashboard-schema flags this plugin doesn't implement
+    # are silently dropped instead of crashing argparse. Schema = source of
+    # truth for which fields render; manifest only supplies pre-filled defaults.
+    args, _ = ap.parse_known_args()
+    return args
 
 
 def latest_checkpoint_step(name):
@@ -342,9 +349,18 @@ def latest_checkpoint_step(name):
     for fn in os.listdir(ckpt_dir):
         if fn.startswith(BASE_CKPT_PREFIX) and fn.endswith(BASE_CKPT_SUFFIX):
             try:
-                steps.append(int(fn[len(BASE_CKPT_PREFIX):-len(BASE_CKPT_SUFFIX)]))
+                n = int(fn[len(BASE_CKPT_PREFIX):-len(BASE_CKPT_SUFFIX)])
             except ValueError:
                 continue
+            # Skip obvious junk: truncated stubs from a crash mid-save before
+            # the atomic-write guard in save.save() landed. Any real Veritate
+            # checkpoint is >> 100KB; <100KB is always a partial torch.save.
+            try:
+                if os.path.getsize(os.path.join(ckpt_dir, fn)) < 100_000:
+                    continue
+            except OSError:
+                continue
+            steps.append(n)
     if not steps:
         raise FileNotFoundError("no step_*.pt under: " + ckpt_dir)
     return max(steps)
@@ -574,13 +590,17 @@ def main():
     elif resume_mode:
         name = args.resume
     else:
-        v = args.version
-        if v.endswith("_qat"):
-            v = v[:-4]
-        elif v.endswith("qat"):
-            v = v[:-3]
-        version_tag = (v + "_qat") if qat_enabled else v
-        name = save.compose_name(args.corpus, args.size, args.precision, version_tag)
+        if getattr(args, "name", "").strip():
+            base = save.compose_name(args.name, args.size)
+            name = (base + "_qat") if qat_enabled else base
+        else:
+            v = args.version
+            if v.endswith("_qat"):
+                v = v[:-4]
+            elif v.endswith("qat"):
+                v = v[:-3]
+            version_tag = (v + "_qat") if qat_enabled else v
+            name = save.compose_name(args.corpus, args.size, args.precision, version_tag)
     print("model name: " + name, flush=True)
 
     train_path, val_path = save.resolve_corpus(args.corpus)
@@ -652,7 +672,10 @@ def main():
         print("wrote: " + paths.config_path(name), flush=True)
     elif resume_mode:
         resume_step = latest_checkpoint_step(name)
-        print("resume: " + name + "  from step " + str(resume_step), flush=True)
+        dropped = save.truncate_train_csv_at(name, resume_step)
+        msg = "resume: " + name + "  from step " + str(resume_step)
+        if dropped: msg += "  (dropped " + str(dropped) + " stale CSV row(s))"
+        print(msg, flush=True)
         resume_opt_state = load_resume_state(model, name, resume_step, device)
     else:
         print("hashing corpus (one-time, may take a few minutes for 200GB)...", flush=True)
