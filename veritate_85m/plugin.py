@@ -10,16 +10,16 @@
 #   decode (per preflight rule 11a).
 # - Optimization stack: bf16 autocast on CUDA (fp32 on CPU), foreach AdamW,
 #   WSD schedule with sqrt decay last 10%, NaN-skip guard, bf16-native RMSNorm.
-# - Self-contained training. Minimal save path: writes <ckpt>.pt + train.csv
-#   directly. No dashboard hooks at train time; the dashboard can load the
-#   resulting checkpoint for inspection on any box.
+# - Uses save.save() so checkpoints carry the full dashboard hook suite (probe,
+#   classroom, grades, math, grammar, reasoning, concepts, surprise, quant_kl,
+#   writing_health, generation, reading_comprehension) and save.append_train_row()
+#   so train.csv lands in the canonical models/<name>/ location.
 # - Corpus: plugins/corpus/fineweb_edu_train.bin (built by build_corpus.py).
 # plugins/veritate_85m/plugin.py
 # ------------------------------------------------------------------------------------
 # Imports
 
 import argparse
-import csv
 import json
 import math
 import os
@@ -36,6 +36,8 @@ REPO_ROOT = os.path.normpath(os.path.join(HERE, "..", ".."))
 sys.path.insert(0, HERE)
 sys.path.insert(0, REPO_ROOT)
 
+from veritate.plugin import save, paths  # noqa: E402
+
 with open(os.path.join(HERE, "manifest.json"), "r", encoding="utf-8") as _f:
     MANIFEST = json.load(_f)
 
@@ -49,7 +51,6 @@ WSD_DECAY_KINDS = ("sqrt", "linear", "cosine")
 PRECISIONS = ("fp32", "bf16")
 BASE_CKPT_PREFIX = "step_"
 BASE_CKPT_SUFFIX = ".pt"
-CSV_HEADER = ["step", "split", "loss", "lr", "grad_norm", "tok_per_s", "wall_s", "seed"]
 
 
 # ------------------------------------------------------------------------------------
@@ -287,39 +288,6 @@ def make_data_loader(bin_path, total_chunk_len, batch_size, seed):
     return draw, N
 
 
-def append_train_row(csv_path, step, split, loss, lr=None, grad_norm=None,
-                     tok_per_s=None, wall_s=None, seed=None):
-    new_file = not os.path.isfile(csv_path)
-    os.makedirs(os.path.dirname(csv_path) or ".", exist_ok=True)
-    with open(csv_path, "a", encoding="utf-8", newline="") as f:
-        w = csv.writer(f)
-        if new_file:
-            w.writerow(CSV_HEADER)
-        w.writerow([
-            int(step), str(split),
-            "" if loss is None else f"{float(loss):.6f}",
-            "" if lr is None else f"{float(lr):.6e}",
-            "" if grad_norm is None else f"{float(grad_norm):.6f}",
-            "" if tok_per_s is None else f"{float(tok_per_s):.2f}",
-            "" if wall_s is None else f"{float(wall_s):.3f}",
-            "" if seed is None else int(seed),
-        ])
-
-
-def save_checkpoint(model, optimizer, step, args, cfg, model_dir):
-    ckpt_dir = os.path.join(model_dir, "checkpoints")
-    os.makedirs(ckpt_dir, exist_ok=True)
-    path = os.path.join(ckpt_dir, f"{BASE_CKPT_PREFIX}{step}{BASE_CKPT_SUFFIX}")
-    torch.save({
-        "model": model.state_dict(),
-        "optimizer": optimizer.state_dict(),
-        "step": step,
-        "config": cfg,
-        "training_args": vars(args),
-    }, path)
-    return path
-
-
 def latest_checkpoint_step(model_dir):
     ckpt_dir = os.path.join(model_dir, "checkpoints")
     if not os.path.isdir(ckpt_dir):
@@ -390,8 +358,9 @@ def main():
     amp_dtype = torch.bfloat16 if (args.precision == "bf16" and device_type == "cuda") else None
 
     os.makedirs(args.output_dir, exist_ok=True)
-    csv_path = os.path.join(args.output_dir, "train.csv")
-    config_path = os.path.join(args.output_dir, "config.json")
+    # name is the basename of output_dir; save.save / save.append_train_row resolve
+    # paths via veritate_mri/readers/paths.py, which roots at <repo>/models/<name>.
+    name = os.path.basename(os.path.normpath(args.output_dir))
 
     cfg = {
         "vocab": args.vocab,
@@ -444,9 +413,8 @@ def main():
         start_step = ckpt.get("step", last)
         print(f"[veritate_85m] resumed from step {start_step}", flush=True)
 
-    # Save config (training-args-aware)
-    with open(config_path, "w", encoding="utf-8") as f:
-        json.dump({**cfg, "training_args": vars(args)}, f, indent=2)
+    # config.json is written by save.save() via _ensure_config the first time
+    # save.save() runs for this model dir; no need to write it here.
 
     # Data
     train_draw, n_train = make_data_loader(args.corpus_bin, args.seq, args.batch_size, args.seed)
@@ -510,9 +478,9 @@ def main():
             mean_l1 = log_buf_l1 / max(1, log_buf_n)
             now = time.time()
             tok_s = (args.log_every * args.batch_size * args.seq) / max(1e-6, now - last_log)
-            append_train_row(csv_path, step, "train", mean_ce, lr=lr,
-                             grad_norm=gnorm, tok_per_s=tok_s, wall_s=now - t0,
-                             seed=args.seed)
+            save.append_train_row(name, step, "train", mean_ce, lr=lr,
+                                  grad_norm=gnorm, tok_per_s=tok_s, wall_s=now - t0,
+                                  seed=args.seed)
             print(f"[veritate_85m] step {step:>6} ce={mean_ce:.4f} l1={mean_l1:.4f} "
                   f"lr={lr:.2e} tok/s={tok_s:.0f} t={now-t0:.0f}s", flush=True)
             log_buf_loss, log_buf_l1, log_buf_n = 0.0, 0.0, 0
@@ -537,13 +505,23 @@ def main():
                         vn += 1
                 vmean = vloss / max(1, vn)
             model.train()
-            append_train_row(csv_path, step, "val", vmean, lr=lr, wall_s=time.time() - t0,
-                             seed=args.seed)
+            save.append_train_row(name, step, "val", vmean, lr=lr, wall_s=time.time() - t0,
+                                  seed=args.seed)
             print(f"[veritate_85m] step {step:>6} val={vmean:.4f}", flush=True)
 
         if step % args.ckpt_every == 0 or step == args.total_steps:
-            path = save_checkpoint(model, opt, step, args, cfg, args.output_dir)
-            print(f"[veritate_85m] saved ckpt at step {step} -> {path}", flush=True)
+            ckpt_args = vars(args).copy()
+            # Pull in the model-shape fields the dump suite + config.json expect.
+            ckpt_args["vocab"]     = model.vocab
+            ckpt_args["hidden"]    = model.hidden
+            ckpt_args["layers"]    = model.layers
+            ckpt_args["ffn"]       = model.ffn
+            ckpt_args["heads"]     = model.heads
+            ckpt_args["seq"]       = model.seq
+            ckpt_args["n_predict"] = model.n_predict
+            ckpt_args.setdefault("description", args.description)
+            path = save.save(model, name, step, optimizer=opt, args=ckpt_args)
+            print(f"[veritate_85m] checkpoint + hooks: {path}", flush=True)
 
     print(f"[veritate_85m] done in {time.time()-t0:.1f}s", flush=True)
 
