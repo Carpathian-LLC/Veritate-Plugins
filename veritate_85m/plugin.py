@@ -1,0 +1,552 @@
+# ------------------------------------------------------------------------------------
+# Developed by Carpathian, LLC.
+# ------------------------------------------------------------------------------------
+# Legal Notice: Distribution Not Authorized.
+# ------------------------------------------------------------------------------------
+# Notes:
+# - veritate_85m: byte-level decoder at h=768 L=12 ffn=3072 heads=12 (vocab=256).
+#   ReLU FFN with L1 sparsity loss on post-activation, 2-byte multi-token-
+#   prediction (MTP) head, byte0_projector contract method for cross-model
+#   decode (per preflight rule 11a).
+# - Optimization stack: bf16 autocast on CUDA (fp32 on CPU), foreach AdamW,
+#   WSD schedule with sqrt decay last 10%, NaN-skip guard, bf16-native RMSNorm.
+# - Self-contained training. Minimal save path: writes <ckpt>.pt + train.csv
+#   directly. No dashboard hooks at train time; the dashboard can load the
+#   resulting checkpoint for inspection on any box.
+# - Corpus: plugins/corpus/fineweb_edu_train.bin (built by build_corpus.py).
+# plugins/veritate_85m/plugin.py
+# ------------------------------------------------------------------------------------
+# Imports
+
+import argparse
+import csv
+import json
+import math
+import os
+import sys
+import time
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+REPO_ROOT = os.path.normpath(os.path.join(HERE, "..", ".."))
+sys.path.insert(0, HERE)
+sys.path.insert(0, REPO_ROOT)
+
+with open(os.path.join(HERE, "manifest.json"), "r", encoding="utf-8") as _f:
+    MANIFEST = json.load(_f)
+
+
+# ------------------------------------------------------------------------------------
+# Constants
+
+VOCAB_BYTE_LEVEL = 256
+LR_SCHEDULES = ("cosine", "linear", "constant", "wsd")
+WSD_DECAY_KINDS = ("sqrt", "linear", "cosine")
+PRECISIONS = ("fp32", "bf16")
+BASE_CKPT_PREFIX = "step_"
+BASE_CKPT_SUFFIX = ".pt"
+CSV_HEADER = ["step", "split", "loss", "lr", "grad_norm", "tok_per_s", "wall_s", "seed"]
+
+
+# ------------------------------------------------------------------------------------
+# Model
+
+class RMSNorm(nn.Module):
+    def __init__(self, hidden, eps=1e-5):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(hidden))
+        self.eps = eps
+
+    def forward(self, x):
+        n = x.float().pow(2).mean(-1, keepdim=True)
+        inv = torch.rsqrt(n + self.eps).to(x.dtype)
+        return x * inv * self.weight
+
+
+class CausalSelfAttention(nn.Module):
+    def __init__(self, hidden, heads):
+        super().__init__()
+        if hidden % heads != 0:
+            raise ValueError(f"hidden ({hidden}) must be divisible by heads ({heads})")
+        self.h = heads
+        self.d = hidden // heads
+        self.qkv = nn.Linear(hidden, 3 * hidden, bias=False)
+        self.proj = nn.Linear(hidden, hidden, bias=False)
+
+    def forward(self, x):
+        B, T, C = x.shape
+        qkv = self.qkv(x).view(B, T, 3, self.h, self.d).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]
+        out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        out = out.transpose(1, 2).contiguous().view(B, T, C)
+        return self.proj(out)
+
+
+class ReluFFN(nn.Module):
+    """FFN with ReLU activation. Saves post-activation tensor so the trainer
+    can apply an L1 sparsity penalty."""
+
+    def __init__(self, hidden, ffn):
+        super().__init__()
+        self.up = nn.Linear(hidden, ffn, bias=False)
+        self.down = nn.Linear(ffn, hidden, bias=False)
+        self._last_post = None
+
+    def forward(self, x):
+        post = F.relu(self.up(x))
+        self._last_post = post
+        return self.down(post)
+
+
+class Block(nn.Module):
+    def __init__(self, hidden, ffn, heads):
+        super().__init__()
+        self.n1 = RMSNorm(hidden)
+        self.attn = CausalSelfAttention(hidden, heads)
+        self.n2 = RMSNorm(hidden)
+        self.ff = ReluFFN(hidden, ffn)
+
+    def forward(self, x):
+        x = x + self.attn(self.n1(x))
+        x = x + self.ff(self.n2(x))
+        return x
+
+
+class MTPHead(nn.Module):
+    """N independent prediction heads off the final hidden state. Head 0 is
+    identity-initialized so byte-0 inherits the trunk's existing semantics.
+    Heads 1..N-1 start near-zero and learn future-byte prediction."""
+
+    def __init__(self, hidden, n_predict, lm_head):
+        super().__init__()
+        self.n_predict = n_predict
+        self.transforms = nn.ModuleList([
+            nn.Linear(hidden, hidden, bias=False) for _ in range(n_predict)
+        ])
+        with torch.no_grad():
+            self.transforms[0].weight.copy_(torch.eye(hidden))
+            for i in range(1, n_predict):
+                nn.init.normal_(self.transforms[i].weight, mean=0.0, std=0.01)
+        self.norms = nn.ModuleList([RMSNorm(hidden) for _ in range(n_predict)])
+        self.lm_head = lm_head
+
+    def forward(self, h):
+        outs = []
+        for i in range(self.n_predict):
+            outs.append(self.lm_head(self.norms[i](self.transforms[i](h))))
+        return torch.stack(outs, dim=2)  # [B, T, N, vocab]
+
+
+class Veritate85M(nn.Module):
+    """Byte-level h=768 L=12 trunk. ReLU+L1 FFN + 2-byte MTP head."""
+
+    def __init__(self, vocab, hidden, layers, ffn, heads, seq, n_predict=2):
+        super().__init__()
+        if vocab != VOCAB_BYTE_LEVEL:
+            raise ValueError(f"vocab must be {VOCAB_BYTE_LEVEL} (byte-level only), got {vocab}")
+        if hidden % heads != 0:
+            raise ValueError(f"hidden ({hidden}) must be divisible by heads ({heads})")
+        self.vocab = vocab
+        self.hidden = hidden
+        self.layers = layers
+        self.ffn = ffn
+        self.heads = heads
+        self.seq = seq
+        self.n_predict = n_predict
+        self._mtp_aux_weight = 0.5
+
+        self.tok_emb = nn.Embedding(vocab, hidden)
+        self.pos_emb = nn.Embedding(seq, hidden)
+        self.blocks = nn.ModuleList([Block(hidden, ffn, heads) for _ in range(layers)])
+        self.n_out = RMSNorm(hidden)
+        self.lm_head = nn.Linear(hidden, vocab, bias=False)
+        # Untied to avoid the MTP autograd-accumulation pitfall the 800M trunk hit.
+
+        self.mtp = MTPHead(hidden, n_predict, self.lm_head)
+
+        # Initialize: all linears + tok_emb get N(0, 0.02), skip MTP transforms
+        # (already initialized in MTPHead.__init__).
+        mtp_param_ids = {id(t.weight) for t in self.mtp.transforms}
+        for p in self.parameters():
+            if p.dim() >= 2 and id(p) not in mtp_param_ids:
+                nn.init.normal_(p, mean=0.0, std=0.02)
+
+    # ------------ cross-model contract (preflight rule 11a) ------------
+
+    def project_byte0(self, h):
+        """Map final hidden state to byte-0 logits. Consumers call this blindly;
+        the model knows what it is (canonical here = MTP transforms[0] + norms[0])."""
+        return self.lm_head(self.mtp.norms[0](self.mtp.transforms[0](h)))
+
+    # ------------ forward ------------
+
+    def forward(self, tokens, targets=None):
+        B, T = tokens.shape
+        if T > self.seq:
+            raise ValueError(f"input length {T} exceeds seq {self.seq}")
+        pos = torch.arange(T, device=tokens.device).unsqueeze(0).expand(B, T)
+        x = self.tok_emb(tokens) + self.pos_emb(pos)
+        for blk in self.blocks:
+            x = blk(x)
+        h = self.n_out(x)
+
+        all_logits = self.mtp(h)  # [B, T, N, vocab]
+        logits_b0 = all_logits[:, :, 0, :]
+
+        total_loss = None
+        if targets is not None:
+            T_keep = max(1, T - (self.n_predict - 1))
+            head_targets = torch.empty(B, T_keep, self.n_predict, dtype=targets.dtype, device=targets.device)
+            head_targets[:, :, 0] = targets[:, :T_keep]
+            for i in range(1, self.n_predict):
+                head_targets[:, :, i] = targets[:, i:T_keep + i]
+            aux_w = float(self._mtp_aux_weight)
+            weights = [1.0] + [aux_w] * (self.n_predict - 1)
+            losses = []
+            for i in range(self.n_predict):
+                logits_i = all_logits[:, :T_keep, i, :].reshape(-1, self.vocab)
+                tgt_i = head_targets[:, :, i].reshape(-1)
+                losses.append(F.cross_entropy(logits_i, tgt_i))
+            total_loss = sum(weights[i] * losses[i] for i in range(self.n_predict))
+
+        return logits_b0, total_loss
+
+    def post_activations(self):
+        """Return the list of last-batch post-ReLU activation tensors for the
+        L1 sparsity loss."""
+        return [blk.ff._last_post for blk in self.blocks if blk.ff._last_post is not None]
+
+
+# ------------------------------------------------------------------------------------
+# Helpers
+
+def lr_at(step, total, warmup, base_lr, min_lr, schedule="wsd",
+          wsd_decay_frac=0.1, wsd_decay_kind="sqrt"):
+    if step < warmup:
+        return base_lr * step / max(1, warmup)
+    p = (step - warmup) / max(1, total - warmup)
+    p = min(max(p, 0.0), 1.0)
+    if schedule == "constant":
+        return base_lr
+    if schedule == "linear":
+        return base_lr + (min_lr - base_lr) * p
+    if schedule == "wsd":
+        decay_frac = max(1e-6, min(1.0, float(wsd_decay_frac)))
+        stable_p = 1.0 - decay_frac
+        if p <= stable_p:
+            return base_lr
+        q = (p - stable_p) / decay_frac
+        if wsd_decay_kind == "linear":
+            shape = 1.0 - q
+        elif wsd_decay_kind == "cosine":
+            shape = 0.5 * (1.0 + math.cos(math.pi * q))
+        else:
+            shape = 1.0 - math.sqrt(q)
+        return min_lr + (base_lr - min_lr) * shape
+    return min_lr + 0.5 * (base_lr - min_lr) * (1.0 + math.cos(math.pi * p))
+
+
+def pick_device(requested):
+    if requested == "cuda":
+        if not torch.cuda.is_available():
+            raise RuntimeError("CUDA requested but torch.cuda.is_available() is False")
+        return "cuda"
+    if requested == "mps":
+        if not (getattr(torch.backends, "mps", None) and torch.backends.mps.is_available()):
+            raise RuntimeError("MPS requested but unavailable")
+        return "mps"
+    if requested == "cpu":
+        return "cpu"
+    if torch.cuda.is_available():
+        return "cuda"
+    if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
+        return "mps"
+    return "cpu"
+
+
+def make_data_loader(bin_path, total_chunk_len, batch_size, seed):
+    arr = np.memmap(bin_path, dtype=np.uint8, mode="r")
+    N = len(arr)
+    rng = np.random.RandomState(seed)
+    if N < total_chunk_len + 2:
+        raise ValueError(f"corpus too small for chunk length: {N} < {total_chunk_len + 2}")
+
+    def draw():
+        starts = rng.randint(0, N - total_chunk_len - 1, size=batch_size, dtype=np.int64)
+        toks = np.empty((batch_size, total_chunk_len), dtype=np.int64)
+        tgts = np.empty((batch_size, total_chunk_len), dtype=np.int64)
+        for b, s in enumerate(starts):
+            toks[b] = arr[s:s + total_chunk_len]
+            tgts[b] = arr[s + 1:s + 1 + total_chunk_len]
+        return torch.from_numpy(toks), torch.from_numpy(tgts)
+
+    return draw, N
+
+
+def append_train_row(csv_path, step, split, loss, lr=None, grad_norm=None,
+                     tok_per_s=None, wall_s=None, seed=None):
+    new_file = not os.path.isfile(csv_path)
+    os.makedirs(os.path.dirname(csv_path) or ".", exist_ok=True)
+    with open(csv_path, "a", encoding="utf-8", newline="") as f:
+        w = csv.writer(f)
+        if new_file:
+            w.writerow(CSV_HEADER)
+        w.writerow([
+            int(step), str(split),
+            "" if loss is None else f"{float(loss):.6f}",
+            "" if lr is None else f"{float(lr):.6e}",
+            "" if grad_norm is None else f"{float(grad_norm):.6f}",
+            "" if tok_per_s is None else f"{float(tok_per_s):.2f}",
+            "" if wall_s is None else f"{float(wall_s):.3f}",
+            "" if seed is None else int(seed),
+        ])
+
+
+def save_checkpoint(model, optimizer, step, args, cfg, model_dir):
+    ckpt_dir = os.path.join(model_dir, "checkpoints")
+    os.makedirs(ckpt_dir, exist_ok=True)
+    path = os.path.join(ckpt_dir, f"{BASE_CKPT_PREFIX}{step}{BASE_CKPT_SUFFIX}")
+    torch.save({
+        "model": model.state_dict(),
+        "optimizer": optimizer.state_dict(),
+        "step": step,
+        "config": cfg,
+        "training_args": vars(args),
+    }, path)
+    return path
+
+
+def latest_checkpoint_step(model_dir):
+    ckpt_dir = os.path.join(model_dir, "checkpoints")
+    if not os.path.isdir(ckpt_dir):
+        raise FileNotFoundError("no checkpoints dir for: " + model_dir)
+    steps = []
+    for fn in os.listdir(ckpt_dir):
+        if fn.startswith(BASE_CKPT_PREFIX) and fn.endswith(BASE_CKPT_SUFFIX):
+            try:
+                steps.append(int(fn[len(BASE_CKPT_PREFIX):-len(BASE_CKPT_SUFFIX)]))
+            except ValueError:
+                continue
+    if not steps:
+        raise FileNotFoundError("no step_*.pt under: " + ckpt_dir)
+    return max(steps)
+
+
+# ------------------------------------------------------------------------------------
+# Args
+
+def parse_args():
+    ap = argparse.ArgumentParser(description=MANIFEST.get("description", ""))
+    ap.add_argument("--corpus_bin", type=str,
+                    default=os.path.join(REPO_ROOT, "plugins", "corpus", "fineweb_edu_train.bin"),
+                    help="Path to the byte-level training .bin (built by build_corpus.py).")
+    ap.add_argument("--val_bin", type=str,
+                    default=os.path.join(REPO_ROOT, "plugins", "corpus", "fineweb_edu_val.bin"),
+                    help="Path to the byte-level val .bin (built by build_corpus.py).")
+    ap.add_argument("--output_dir", type=str,
+                    default=os.path.join(REPO_ROOT, "models", "fineweb_edu_85m_bf16_v1_sparse"),
+                    help="Output model directory.")
+    ap.add_argument("--device", type=str, default="auto",
+                    choices=("auto", "cpu", "cuda", "mps"),
+                    help="Force a device; 'auto' picks the best available.")
+    ap.add_argument("--description", type=str, default="")
+    ap.add_argument("--resume", action="store_true",
+                    help="Resume from the latest step_*.pt in --output_dir if present.")
+    for k, v in MANIFEST.get("defaults", {}).items():
+        if isinstance(v, bool):
+            ap.add_argument("--" + k, action=argparse.BooleanOptionalAction, default=bool(v))
+        elif isinstance(v, int):
+            ap.add_argument("--" + k, type=int, default=v)
+        elif isinstance(v, float):
+            ap.add_argument("--" + k, type=float, default=v)
+        else:
+            ap.add_argument("--" + k, type=str, default=str(v))
+    return ap.parse_args()
+
+
+# ------------------------------------------------------------------------------------
+# Main
+
+def main():
+    args = parse_args()
+    if args.lr_schedule not in LR_SCHEDULES:
+        raise ValueError(f"unknown lr_schedule: {args.lr_schedule}")
+    if args.lr_schedule == "wsd" and args.wsd_decay_kind not in WSD_DECAY_KINDS:
+        raise ValueError(f"unknown wsd_decay_kind: {args.wsd_decay_kind}")
+    if args.precision not in PRECISIONS:
+        raise ValueError(f"unknown precision: {args.precision}")
+    if not os.path.isfile(args.corpus_bin):
+        raise FileNotFoundError(
+            f"corpus_bin not found: {args.corpus_bin}\n"
+            f"Run: python plugins/veritate_85m/build_corpus.py"
+        )
+
+    device_type = pick_device(args.device)
+    device = torch.device(device_type)
+    amp_dtype = torch.bfloat16 if (args.precision == "bf16" and device_type == "cuda") else None
+
+    os.makedirs(args.output_dir, exist_ok=True)
+    csv_path = os.path.join(args.output_dir, "train.csv")
+    config_path = os.path.join(args.output_dir, "config.json")
+
+    cfg = {
+        "vocab": args.vocab,
+        "hidden": args.hidden,
+        "layers": args.layers,
+        "ffn": args.ffn,
+        "heads": args.heads,
+        "seq": args.seq,
+        "n_predict": args.n_predict,
+        "activation": "relu",
+        "byte0_projector": "mtp.norms[0] o mtp.transforms[0] o lm_head",
+    }
+
+    print(f"[veritate_85m] device={device_type} amp_dtype={amp_dtype}", flush=True)
+    print(f"[veritate_85m] output={args.output_dir}", flush=True)
+    print(f"[veritate_85m] corpus={args.corpus_bin}", flush=True)
+
+    # Model
+    torch.manual_seed(args.seed)
+    np.random.seed(args.seed)
+    model = Veritate85M(
+        vocab=args.vocab, hidden=args.hidden, layers=args.layers,
+        ffn=args.ffn, heads=args.heads, seq=args.seq, n_predict=args.n_predict,
+    )
+    model._mtp_aux_weight = args.mtp_aux_weight
+    model = model.to(device)
+    n_params = sum(p.numel() for p in model.parameters())
+    print(f"[veritate_85m] params: {n_params:,} ({n_params/1e6:.1f}M)", flush=True)
+
+    # Optimizer
+    opt = torch.optim.AdamW(
+        model.parameters(),
+        lr=args.base_lr,
+        betas=(args.beta1, args.beta2),
+        eps=1e-6,
+        weight_decay=args.weight_decay,
+        foreach=True,
+    )
+
+    # Resume
+    start_step = 0
+    if args.resume:
+        last = latest_checkpoint_step(args.output_dir)
+        ckpt = torch.load(
+            os.path.join(args.output_dir, "checkpoints", f"step_{last}.pt"),
+            map_location=device, weights_only=False,
+        )
+        model.load_state_dict(ckpt["model"], strict=True)
+        opt.load_state_dict(ckpt["optimizer"])
+        start_step = ckpt.get("step", last)
+        print(f"[veritate_85m] resumed from step {start_step}", flush=True)
+
+    # Save config (training-args-aware)
+    with open(config_path, "w", encoding="utf-8") as f:
+        json.dump({**cfg, "training_args": vars(args)}, f, indent=2)
+
+    # Data
+    train_draw, n_train = make_data_loader(args.corpus_bin, args.seq, args.batch_size, args.seed)
+    val_draw, n_val = None, 0
+    if os.path.isfile(args.val_bin):
+        val_draw, n_val = make_data_loader(args.val_bin, args.seq, args.batch_size, args.seed + 1)
+    print(f"[veritate_85m] train_bytes={n_train:,}  val_bytes={n_val:,}", flush=True)
+
+    model.train()
+    t0 = time.time()
+    last_log = t0
+    log_buf_loss, log_buf_l1, log_buf_n = 0.0, 0.0, 0
+
+    for step in range(start_step + 1, args.total_steps + 1):
+        lr = lr_at(step, args.total_steps, args.warmup_steps, args.base_lr, args.min_lr,
+                   schedule=args.lr_schedule,
+                   wsd_decay_frac=args.wsd_decay_frac, wsd_decay_kind=args.wsd_decay_kind)
+        for g in opt.param_groups:
+            g["lr"] = lr
+
+        toks, tgts = train_draw()
+        toks = toks.to(device, non_blocking=False)
+        tgts = tgts.to(device, non_blocking=False)
+
+        opt.zero_grad(set_to_none=True)
+        if amp_dtype is not None:
+            with torch.amp.autocast(device_type=device_type, dtype=amp_dtype):
+                logits, ce = model(toks, tgts)
+        else:
+            logits, ce = model(toks, tgts)
+
+        if torch.isnan(ce) or torch.isinf(ce):
+            print(f"[veritate_85m] step {step}: NaN/Inf loss — skipping", flush=True)
+            continue
+
+        # L1 sparsity penalty on post-ReLU activations.
+        l1_val = 0.0
+        if args.l1_lambda > 0:
+            posts = model.post_activations()
+            if posts:
+                l1 = args.l1_lambda * sum(p.abs().mean() for p in posts)
+                loss = ce + l1
+                l1_val = float(l1.detach())
+            else:
+                loss = ce
+        else:
+            loss = ce
+
+        loss.backward()
+        gnorm = None
+        if args.grad_clip > 0:
+            gnorm = float(torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip))
+        opt.step()
+
+        log_buf_loss += float(ce.detach())
+        log_buf_l1 += l1_val
+        log_buf_n += 1
+
+        if step % args.log_every == 0:
+            mean_ce = log_buf_loss / max(1, log_buf_n)
+            mean_l1 = log_buf_l1 / max(1, log_buf_n)
+            now = time.time()
+            tok_s = (args.log_every * args.batch_size * args.seq) / max(1e-6, now - last_log)
+            append_train_row(csv_path, step, "train", mean_ce, lr=lr,
+                             grad_norm=gnorm, tok_per_s=tok_s, wall_s=now - t0,
+                             seed=args.seed)
+            print(f"[veritate_85m] step {step:>6} ce={mean_ce:.4f} l1={mean_l1:.4f} "
+                  f"lr={lr:.2e} tok/s={tok_s:.0f} t={now-t0:.0f}s", flush=True)
+            log_buf_loss, log_buf_l1, log_buf_n = 0.0, 0.0, 0
+            last_log = now
+
+        if val_draw is not None and (step % args.eval_every == 0 or step == args.total_steps):
+            model.eval()
+            with torch.no_grad():
+                vloss = 0.0
+                vn = 0
+                for _ in range(args.eval_iters):
+                    vtoks, vtgts = val_draw()
+                    vtoks = vtoks.to(device, non_blocking=False)
+                    vtgts = vtgts.to(device, non_blocking=False)
+                    if amp_dtype is not None:
+                        with torch.amp.autocast(device_type=device_type, dtype=amp_dtype):
+                            _, vce = model(vtoks, vtgts)
+                    else:
+                        _, vce = model(vtoks, vtgts)
+                    if not (torch.isnan(vce) or torch.isinf(vce)):
+                        vloss += float(vce)
+                        vn += 1
+                vmean = vloss / max(1, vn)
+            model.train()
+            append_train_row(csv_path, step, "val", vmean, lr=lr, wall_s=time.time() - t0,
+                             seed=args.seed)
+            print(f"[veritate_85m] step {step:>6} val={vmean:.4f}", flush=True)
+
+        if step % args.ckpt_every == 0 or step == args.total_steps:
+            path = save_checkpoint(model, opt, step, args, cfg, args.output_dir)
+            print(f"[veritate_85m] saved ckpt at step {step} -> {path}", flush=True)
+
+    print(f"[veritate_85m] done in {time.time()-t0:.1f}s", flush=True)
+
+
+if __name__ == "__main__":
+    main()

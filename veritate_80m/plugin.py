@@ -69,7 +69,8 @@ SIZE_PRESETS = {
 BASE_CKPT_PREFIX = "step_"
 BASE_CKPT_SUFFIX = ".pt"
 
-LR_SCHEDULES = ("cosine", "linear", "constant")
+LR_SCHEDULES = ("cosine", "linear", "constant", "wsd")
+WSD_DECAY_KINDS = ("sqrt", "linear", "cosine")
 PRECISIONS   = ("fp32", "bf16")
 
 
@@ -132,7 +133,12 @@ def apply_resume_overrides(args, argv):
             setattr(args, k, v)
 
 
-def lr_at(step, total, warmup, base_lr, min_lr, schedule="cosine"):
+def lr_at(step, total, warmup, base_lr, min_lr, schedule="cosine",
+          wsd_decay_frac=0.1, wsd_decay_kind="sqrt"):
+    """LR schedule. WSD (Warmup-Stable-Decay) keeps base_lr flat after
+    warmup until the last `wsd_decay_frac` of training, then decays to
+    min_lr under `wsd_decay_kind` ∈ {sqrt, linear, cosine}. See 800m
+    plugin's lr_at for the same wiring."""
     if step < warmup:
         return base_lr * step / max(1, warmup)
     p = (step - warmup) / max(1, total - warmup)
@@ -141,6 +147,20 @@ def lr_at(step, total, warmup, base_lr, min_lr, schedule="cosine"):
         return base_lr
     if schedule == "linear":
         return base_lr + (min_lr - base_lr) * p
+    if schedule == "wsd":
+        decay_frac = max(1e-6, min(1.0, float(wsd_decay_frac)))
+        stable_p = 1.0 - decay_frac
+        if p <= stable_p:
+            return base_lr
+        q = (p - stable_p) / decay_frac
+        q = min(max(q, 0.0), 1.0)
+        if wsd_decay_kind == "linear":
+            shape = 1.0 - q
+        elif wsd_decay_kind == "cosine":
+            shape = 0.5 * (1.0 + math.cos(math.pi * q))
+        else:
+            shape = 1.0 - math.sqrt(q)
+        return min_lr + (base_lr - min_lr) * shape
     return min_lr + 0.5 * (base_lr - min_lr) * (1.0 + math.cos(math.pi * p))
 
 
@@ -240,7 +260,7 @@ def write_config(name, args, base_cfg, n_params, corpus_hash):
 
 
 def load_resume_state(model, name, step, device):
-    ckpt = torch.load(paths.checkpoint_path(name, step), map_location=device, weights_only=True)
+    ckpt = torch.load(paths.checkpoint_path(name, step), map_location=device, weights_only=False)
     sd = ckpt["model"]
     if any(k.startswith("base.") for k in sd):
         # incoming checkpoint was wrapped by an adapter (M1/M3); strip the base.
@@ -285,6 +305,14 @@ def main():
         raise ValueError("unknown precision: " + str(args.precision))
     if args.lr_schedule not in LR_SCHEDULES:
         raise ValueError("unknown lr_schedule: " + str(args.lr_schedule))
+    if args.lr_schedule == "wsd":
+        kind = getattr(args, "wsd_decay_kind", "sqrt")
+        if kind not in WSD_DECAY_KINDS:
+            raise ValueError("unknown wsd_decay_kind: " + str(kind)
+                             + " (valid: " + ", ".join(WSD_DECAY_KINDS) + ")")
+        frac = float(getattr(args, "wsd_decay_frac", 0.1))
+        if not (0.0 < frac <= 1.0):
+            raise ValueError("wsd_decay_frac must be in (0, 1], got " + str(frac))
 
     if qat_source is not None:
         # phase B: continuing from a non-QAT base into QAT. new model gets the
@@ -384,7 +412,9 @@ def main():
     start_step = resume_step + 1
     for step in range(start_step, args.total_steps + 1):
         lr = lr_at(step, args.total_steps, args.warmup_steps, args.base_lr, args.min_lr,
-                   schedule=args.lr_schedule)
+                   schedule=args.lr_schedule,
+                   wsd_decay_frac=getattr(args, "wsd_decay_frac", 0.1),
+                   wsd_decay_kind=getattr(args, "wsd_decay_kind", "sqrt"))
         for g in opt.param_groups:
             g["lr"] = lr
 
