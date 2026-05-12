@@ -317,13 +317,18 @@ def parse_args():
                     help="Path to the byte-level val .bin (built by build_corpus.py).")
     ap.add_argument("--output_dir", type=str,
                     default=os.path.join(REPO_ROOT, "models", "fineweb_edu_85m_bf16_v1_sparse"),
-                    help="Output model directory.")
+                    help="Output model directory. Ignored when --name is set.")
+    ap.add_argument("--name", type=str, default="",
+                    help="User-friendly model slug. When set, output_dir becomes "
+                         "<repo>/models/<slug>_<size>, overriding --output_dir.")
     ap.add_argument("--device", type=str, default="auto",
                     choices=("auto", "cpu", "cuda", "mps"),
                     help="Force a device; 'auto' picks the best available.")
     ap.add_argument("--description", type=str, default="")
-    ap.add_argument("--resume", action="store_true",
-                    help="Resume from the latest step_*.pt in --output_dir if present.")
+    ap.add_argument("--resume", type=str, default="",
+                    help="Model name to resume (e.g. 'fineweb_edu_85m_bf16_v1_sparse'). "
+                         "When set, output_dir becomes <repo>/models/<resume>, overriding "
+                         "--output_dir and --name. Matches the other plugin trainers' contract.")
     for k, v in MANIFEST.get("defaults", {}).items():
         if isinstance(v, bool):
             ap.add_argument("--" + k, action=argparse.BooleanOptionalAction, default=bool(v))
@@ -357,6 +362,13 @@ def main():
     device = torch.device(device_type)
     amp_dtype = torch.bfloat16 if (args.precision == "bf16" and device_type == "cuda") else None
 
+    # Path precedence: --resume wins (it's the existing model dir), then --name
+    # (user composes a fresh one), then --output_dir (the manual override).
+    if args.resume and args.resume.strip():
+        args.output_dir = os.path.join(REPO_ROOT, "models", args.resume.strip())
+    elif args.name and args.name.strip():
+        composed = save.compose_name(args.name, args.size)
+        args.output_dir = os.path.join(REPO_ROOT, "models", composed)
     os.makedirs(args.output_dir, exist_ok=True)
     # name is the basename of output_dir; save.save / save.append_train_row resolve
     # paths via veritate_mri/readers/paths.py, which roots at <repo>/models/<name>.
