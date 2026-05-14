@@ -261,6 +261,18 @@ def write_config(name, args, base_cfg, n_params, n_active_est, corpus_hash):
     if corpus_hash:
         ta["corpus_sha256"] = corpus_hash.get("train_sha256")
         ta["corpus_bytes"]  = corpus_hash.get("train_bytes")
+    elif os.path.isfile(cfg_path):
+        # Resume snapshot: preserve the original corpus integrity record so a
+        # live-args rewrite doesn't blank corpus_sha256/bytes.
+        try:
+            with open(cfg_path, "r", encoding="utf-8") as _f:
+                _prior_ta = (json.load(_f) or {}).get("training_args") or {}
+            if "corpus_sha256" not in ta and _prior_ta.get("corpus_sha256") is not None:
+                ta["corpus_sha256"] = _prior_ta["corpus_sha256"]
+            if "corpus_bytes" not in ta and _prior_ta.get("corpus_bytes") is not None:
+                ta["corpus_bytes"]  = _prior_ta["corpus_bytes"]
+        except (OSError, ValueError):
+            pass
     shape = dict(base_cfg)
     shape["seq"]         = args.seq
     shape["vocab"]       = _mega.VOCAB_BYTE_LEVEL
@@ -447,6 +459,12 @@ def main():
         if dropped: msg += "  (dropped " + str(dropped) + " stale CSV row(s))"
         print(msg, flush=True)
         resume_opt_state = load_resume_state(model, name, resume_step, device)
+        # Snapshot the live training args back to config.json. Without this,
+        # any explicit override on this resume (e.g. --ckpt_every, --total_steps)
+        # is invisible in the stored config, and the dashboard's pre-fill on the
+        # next continue silently drifts from what the trainer actually used.
+        write_config(name, args, shape, n_params, n_active_est, corpus_hash=None)
+        print("rewrote config (live snapshot): " + paths.config_path(name), flush=True)
     else:
         print("hashing corpus (one-time)...", flush=True)
         corpus_hash = save.hash_corpus(args.corpus)

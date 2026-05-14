@@ -502,9 +502,36 @@ def main():
         print(f"[veritate_85m] resumed from step {start_step}"
               + (f" (dropped {dropped} stale CSV row(s))" if dropped else ""),
               flush=True)
+        # Snapshot live args back to config.json. save._ensure_config only
+        # writes when the file is missing, so without this any override on
+        # resume (e.g. --total_steps, --ckpt_every) is invisible in the
+        # stored config and the dashboard's pre-fill drifts from what the
+        # trainer actually used.
+        cfg_path = paths.config_path(name)
+        snap = vars(args).copy()
+        snap["vocab"]     = model.vocab
+        snap["hidden"]    = model.hidden
+        snap["layers"]    = model.layers
+        snap["ffn"]       = model.ffn
+        snap["heads"]     = model.heads
+        snap["seq"]       = model.seq
+        snap["n_predict"] = model.n_predict
+        if os.path.isfile(cfg_path):
+            try:
+                with open(cfg_path, "r", encoding="utf-8") as _f:
+                    _prior = json.load(_f) or {}
+                for _k in ("corpus_sha256", "corpus_bytes"):
+                    if _k not in snap and _prior.get(_k) is not None:
+                        snap[_k] = _prior[_k]
+            except (OSError, ValueError):
+                pass
+        with open(cfg_path, "w", encoding="utf-8") as f:
+            json.dump(snap, f, indent=2)
+        print(f"[veritate_85m] rewrote config (live snapshot): {cfg_path}", flush=True)
 
     # config.json is written by save.save() via _ensure_config the first time
-    # save.save() runs for this model dir; no need to write it here.
+    # save.save() runs for this model dir; no need to write it here on a
+    # fresh run (the resume branch above writes it directly).
 
     # Data
     train_draw, n_train = make_data_loader(args.corpus_bin, args.seq, args.batch_size, args.seed)
