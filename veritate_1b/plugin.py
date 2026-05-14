@@ -39,7 +39,7 @@ REPO_ROOT = os.path.normpath(os.path.join(HERE, "..", ".."))
 sys.path.insert(0, HERE)
 sys.path.insert(0, REPO_ROOT)
 
-from veritate.plugin import save, paths, qat as qat_helpers
+from veritate_core.plugin import save, paths, qat as qat_helpers
 
 import mega as _mega
 

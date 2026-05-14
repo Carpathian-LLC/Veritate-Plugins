@@ -54,7 +54,7 @@ This is the contract that makes your training run show up in the dashboard. The 
 **The whole surface you need is two functions in one module.**
 
 ```python
-from veritate.plugin import save, paths
+from veritate_core.plugin import save, paths
 ```
 
 `veritate.plugin` is the only thing a plugin is allowed to import from outside its own folder. The full contract is in [`documentation/plugins/contract.md`](../documentation/plugins/contract.md). The two calls below are the ones every trainer makes.
@@ -64,7 +64,7 @@ from veritate.plugin import save, paths
 Call this at every logging step. It appends one row to `models/<name>/train.csv`, which is what the loss chart reads.
 
 ```python
-from veritate.plugin import save
+from veritate_core.plugin import save
 
 save.append_train_row(
     name,                       # model dir name
@@ -86,7 +86,7 @@ Cheap. Call it for both train and val rows. The dashboard's loss curve, throughp
 Call this every time you want to save a checkpoint. It writes the `.pt` file AND runs the full dump suite. One call, eight artifacts on disk.
 
 ```python
-from veritate.plugin import save
+from veritate_core.plugin import save
 
 ckpt_path = save.save(
     model,                      # torch.nn.Module with a vanilla state_dict()

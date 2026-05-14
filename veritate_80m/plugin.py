@@ -38,7 +38,7 @@ REPO_ROOT = os.path.normpath(os.path.join(HERE, "..", ".."))
 sys.path.insert(0, HERE)
 sys.path.insert(0, REPO_ROOT)
 
-from veritate.plugin import save, paths, model as _model_mod, qat as qat_helpers
+from veritate_core.plugin import save, paths, model as _model_mod, qat as qat_helpers
 
 Veritate         = _model_mod.Veritate
 VOCAB_BYTE_LEVEL = _model_mod.VOCAB_BYTE_LEVEL

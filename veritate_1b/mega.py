@@ -24,8 +24,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from veritate import qat as _qat
-from veritate.model import (
+from veritate_core import qat as _qat
+from veritate_core.model import (
     VOCAB_BYTE_LEVEL,
     RMSNorm,
     QuantLinear,

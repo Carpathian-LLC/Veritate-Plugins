@@ -46,9 +46,9 @@ REPO_ROOT = os.path.normpath(os.path.join(HERE, "..", ".."))
 sys.path.insert(0, HERE)
 sys.path.insert(0, REPO_ROOT)
 
-from veritate.plugin import save, paths, qat as qat_helpers
-from veritate.model import RMSNorm, QuantLinear, FFN, VOCAB_BYTE_LEVEL
-from veritate import qat as _qat
+from veritate_core.plugin import save, paths, qat as qat_helpers
+from veritate_core.model import RMSNorm, QuantLinear, FFN, VOCAB_BYTE_LEVEL
+from veritate_core import qat as _qat
 
 
 with open(os.path.join(HERE, "manifest.json"), "r", encoding="utf-8") as _f:

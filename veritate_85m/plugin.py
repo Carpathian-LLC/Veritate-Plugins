@@ -36,7 +36,7 @@ REPO_ROOT = os.path.normpath(os.path.join(HERE, "..", ".."))
 sys.path.insert(0, HERE)
 sys.path.insert(0, REPO_ROOT)
 
-from veritate.plugin import save, paths  # noqa: E402
+from veritate_core.plugin import save, paths  # noqa: E402
 
 with open(os.path.join(HERE, "manifest.json"), "r", encoding="utf-8") as _f:
     MANIFEST = json.load(_f)
